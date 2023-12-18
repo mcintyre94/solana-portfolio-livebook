@@ -22,8 +22,11 @@ coinmarketcap_api_key_input = Kino.Input.password("Coinmarket API Key")
 
 ```elixir
 defmodule TokenFetcher do
+  @lamports_per_sol 1_000_000_000
+  @base_url "https://rpc.helius.xyz"
+
   def get_tokens_for(address, api_key) do
-    url = "https://rpc.helius.xyz/?api-key=" <> api_key
+    url = "#{@base_url}/?api-key=#{api_key}"
 
     body = %{
       jsonrpc: "2.0",
@@ -56,7 +59,7 @@ defmodule TokenFetcher do
   end
 
   def get_balance_for(address, api_key) do
-    url = "https://rpc.helius.xyz/?api-key=" <> api_key
+    url = "#{@base_url}/?api-key=#{api_key}"
 
     body = %{
       jsonrpc: "2.0",
@@ -65,7 +68,46 @@ defmodule TokenFetcher do
       params: [address]
     }
 
-    Req.post!(url, json: body).body["result"]["value"] / 1_000_000_000
+    Req.post!(url, json: body).body["result"]["value"] / @lamports_per_sol
+  end
+
+  def get_stake_for(address, api_key) do
+    url = "#{@base_url}/?api-key=#{api_key}"
+
+    body = %{
+      jsonrpc: "2.0",
+      id: "stake-accounts-#{address}",
+      # we get stake accounts by querying getProgramAccounts for the stake program
+      method: "getProgramAccounts",
+      params: [
+        "Stake11111111111111111111111111111111111111",
+        %{
+          encoding: "jsonParsed",
+          # withdrawer is at offset 44
+          filters: [
+            %{
+              memcmp: %{
+                offset: 44,
+                bytes: address
+              }
+            }
+          ]
+        }
+      ]
+    }
+
+    result = Req.post!(url, json: body).body["result"]
+
+    # sum the lamports in every stake account
+    lamports =
+      result
+      |> Enum.map(
+        &(&1["account"]["data"]["parsed"]["info"]["stake"]["delegation"]["stake"]
+          |> String.to_integer())
+      )
+      |> Enum.sum()
+
+    lamports / @lamports_per_sol
   end
 end
 ```
@@ -165,25 +207,47 @@ end
 
 ```elixir
 defmodule Analyser do
-  def render_for_addresses(addresses, include_unstaked_sol, helius_api_key, cmc_api_key) do
+  def render_for_addresses(
+        addresses,
+        include_unstaked_sol,
+        include_staked_sol,
+        helius_api_key,
+        cmc_api_key
+      ) do
     tokens =
       addresses
       |> Enum.map(&TokenFetcher.get_tokens_for(&1, helius_api_key))
       |> TokenAnalyse.analyse_lists_of_tokens()
 
+    sol_price =
+      if include_unstaked_sol or include_staked_sol do
+        SolPrice.fetch_latest_price(cmc_api_key)
+      else
+        0
+      end
+
     tokens =
-      case include_unstaked_sol do
-        false ->
-          tokens
+      if include_unstaked_sol do
+        sol_balance =
+          addresses
+          |> Enum.map(&TokenFetcher.get_balance_for(&1, helius_api_key))
+          |> Enum.sum()
 
-        true ->
-          sol_balance =
-            addresses
-            |> Enum.map(&TokenFetcher.get_balance_for(&1, helius_api_key))
-            |> Enum.sum()
+        [%{symbol: "SOL (unstaked)", value_usd: sol_balance * sol_price} | tokens]
+      else
+        tokens
+      end
 
-          sol_price = SolPrice.fetch_latest_price(cmc_api_key)
-          [%{symbol: "SOL", value_usd: sol_balance * sol_price} | tokens]
+    tokens =
+      if include_staked_sol do
+        sol_balance =
+          addresses
+          |> Enum.map(&TokenFetcher.get_stake_for(&1, helius_api_key))
+          |> Enum.sum()
+
+        [%{symbol: "SOL (staked)", value_usd: sol_balance * sol_price} | tokens]
+      else
+        tokens
       end
 
     tokens
@@ -202,7 +266,8 @@ form =
   Kino.Control.form(
     [
       addresses: Kino.Input.textarea("Solana Addresses (one per line)"),
-      unstaked_sol: Kino.Input.checkbox("Include unstaked SOL", default: true)
+      unstaked_sol: Kino.Input.checkbox("Include unstaked SOL", default: true),
+      staked_sol: Kino.Input.checkbox("Include staked SOL", default: true)
     ],
     submit: "Analyse"
   )
@@ -215,9 +280,11 @@ frame = Kino.Frame.new(placeholder: false)
 <hr />
 
 ```elixir
+Kino.Frame.render(frame, Kino.Markdown.new(""))
+
 for event <- Kino.Control.stream(form) do
   addresses = event.data.addresses |> String.split("\n") |> Enum.filter(&(String.length(&1) > 0))
-  require_sol_price = event.data.unstaked_sol
+  require_sol_price = event.data.unstaked_sol or event.data.staked_sol
   helius_api_key = Kino.Input.read(helius_api_key_input)
   cmc_api_key = Kino.Input.read(coinmarketcap_api_key_input)
 
@@ -234,10 +301,13 @@ for event <- Kino.Control.stream(form) do
 
   case errors do
     [] ->
+      Kino.Frame.render(frame, Kino.Text.new("Loading..."))
+
       rendered =
         Analyser.render_for_addresses(
           addresses,
           event.data.unstaked_sol,
+          event.data.staked_sol,
           helius_api_key,
           cmc_api_key
         )
