@@ -9,8 +9,6 @@ Mix.install(
   ],
   force: true
 )
-
-require Logger
 ```
 
 ## Config
@@ -18,10 +16,6 @@ require Logger
 ```elixir
 helius_api_key_input = Kino.Input.password("Helius API Key") |> Kino.render()
 coinmarketcap_api_key_input = Kino.Input.password("Coinmarket API Key")
-```
-
-```elixir
-addresses_input = Kino.Input.textarea("Solana Addresses")
 ```
 
 ## The magic...
@@ -49,8 +43,8 @@ defmodule TokenFetcher do
     result = Req.post!(url, json: body).body["result"]
 
     if result["total"] > 1000 do
-      Logger.warning(
-        "Wallet #{address} has more than 1000 assets. Pagination is not implemented yet so will only get the first 1000"
+      Kino.render(
+        "⚠️ Wallet #{address} has more than 1000 assets. Pagination is not implemented yet so will only get the first 1000"
       )
     end
 
@@ -144,8 +138,12 @@ defmodule TokenDisplay do
     |> VegaLite.data_from_values(displayable_tokens)
     |> VegaLite.mark(:arc)
     |> VegaLite.encode_field(:theta, "value_usd", type: :quantitative)
-    |> VegaLite.encode_field(:color, "symbol", type: :nominal)
+    |> VegaLite.encode_field(:color, "symbol",
+      type: :nominal,
+      sort: %{field: "value_usd", order: "descending"}
+    )
     |> VegaLite.encode_field(:tooltip, "tooltip", type: :nominal)
+    |> VegaLite.encode_field(:order, "value_usd", type: :quantitative, sort: "descending")
   end
 end
 ```
@@ -165,32 +163,94 @@ defmodule SolPrice do
 end
 ```
 
+```elixir
+defmodule Analyser do
+  def render_for_addresses(addresses, include_unstaked_sol, helius_api_key, cmc_api_key) do
+    tokens =
+      addresses
+      |> Enum.map(&TokenFetcher.get_tokens_for(&1, helius_api_key))
+      |> TokenAnalyse.analyse_lists_of_tokens()
+
+    tokens =
+      case include_unstaked_sol do
+        false ->
+          tokens
+
+        true ->
+          sol_balance =
+            addresses
+            |> Enum.map(&TokenFetcher.get_balance_for(&1, helius_api_key))
+            |> Enum.sum()
+
+          sol_price = SolPrice.fetch_latest_price(cmc_api_key)
+          [%{symbol: "SOL", value_usd: sol_balance * sol_price} | tokens]
+      end
+
+    tokens
+    |> TokenDisplay.make_displayable()
+    |> TokenDisplay.render()
+  end
+end
+```
+
 ## Analyse!
 
 ```elixir
-helius_api_key = Kino.Input.read(helius_api_key_input)
-if String.length(helius_api_key) == 0, do: Kino.render("⚠️ No Helius API key!")
+Kino.Markdown.new("<br />") |> Kino.render()
 
-cmc_api_key = Kino.Input.read(coinmarketcap_api_key_input)
-if String.length(cmc_api_key) == 0, do: Kino.render("⚠️ No Coinmarket API key!")
+form =
+  Kino.Control.form(
+    [
+      addresses: Kino.Input.textarea("Solana Addresses (one per line)"),
+      unstaked_sol: Kino.Input.checkbox("Include unstaked SOL", default: true)
+    ],
+    submit: "Analyse"
+  )
 
-addresses = Kino.Input.read(addresses_input)
-if String.length(addresses) == 0, do: Kino.render("⚠️ No addresses!")
-addresses = addresses |> String.split("\n") |> Enum.filter(&(String.length(&1) > 0))
+form |> Kino.render()
+Kino.Markdown.new("<br /><br />") |> Kino.render()
+frame = Kino.Frame.new(placeholder: false)
+```
 
-tokens =
-  addresses
-  |> Enum.map(&TokenFetcher.get_tokens_for(&1, helius_api_key))
-  |> TokenAnalyse.analyse_lists_of_tokens()
+<hr />
 
-sol_balance =
-  addresses
-  |> Enum.map(&TokenFetcher.get_balance_for(&1, helius_api_key))
-  |> Enum.sum()
+```elixir
+for event <- Kino.Control.stream(form) do
+  addresses = event.data.addresses |> String.split("\n") |> Enum.filter(&(String.length(&1) > 0))
+  require_sol_price = event.data.unstaked_sol
+  helius_api_key = Kino.Input.read(helius_api_key_input)
+  cmc_api_key = Kino.Input.read(coinmarketcap_api_key_input)
 
-sol_price = SolPrice.fetch_latest_price(cmc_api_key)
+  errors =
+    [
+      if(Enum.count(addresses) == 0, do: "No addresses entered", else: nil),
+      if(String.length(helius_api_key) == 0, do: "No helius API key", else: nil),
+      if(require_sol_price and String.length(cmc_api_key) == 0,
+        do: "CoinMarketCap API key is required if including SOL",
+        else: nil
+      )
+    ]
+    |> Enum.filter(&(&1 != nil))
 
-[%{symbol: "SOL", value_usd: sol_balance * sol_price} | tokens]
-|> TokenDisplay.make_displayable()
-|> TokenDisplay.render()
+  case errors do
+    [] ->
+      rendered =
+        Analyser.render_for_addresses(
+          addresses,
+          event.data.unstaked_sol,
+          helius_api_key,
+          cmc_api_key
+        )
+
+      Kino.Frame.render(frame, rendered)
+
+    _ ->
+      errors_string = errors |> Enum.map(&"⚠️ #{&1}") |> Enum.join("\n -")
+
+      Kino.Frame.render(
+        frame,
+        Kino.Markdown.new("## Errors\n\n#{errors_string}")
+      )
+  end
+end
 ```
