@@ -1,0 +1,196 @@
+# Helius Portfolio Tracker
+
+```elixir
+Mix.install(
+  [
+    {:kino, "~> 0.12.0"},
+    {:req, "~> 0.4.0"},
+    {:kino_vega_lite, "~> 0.1.10"}
+  ],
+  force: true
+)
+
+require Logger
+```
+
+## Config
+
+```elixir
+helius_api_key_input = Kino.Input.password("Helius API Key") |> Kino.render()
+coinmarketcap_api_key_input = Kino.Input.password("Coinmarket API Key")
+```
+
+```elixir
+addresses_input = Kino.Input.textarea("Solana Addresses")
+```
+
+## The magic...
+
+```elixir
+defmodule TokenFetcher do
+  def get_tokens_for(address, api_key) do
+    url = "https://rpc.helius.xyz/?api-key=" <> api_key
+
+    body = %{
+      jsonrpc: "2.0",
+      id: "tokens-#{address}",
+      method: "getAssetsByOwner",
+      params: %{
+        ownerAddress: address,
+        page: 1,
+        limit: 1000,
+        displayOptions: %{
+          showFungible: true,
+          showGrandTotal: true
+        }
+      }
+    }
+
+    result = Req.post!(url, json: body).body["result"]
+
+    if result["total"] > 1000 do
+      Logger.warning(
+        "Wallet #{address} has more than 1000 assets. Pagination is not implemented yet so will only get the first 1000"
+      )
+    end
+
+    result["items"]
+    |> Enum.filter(fn item ->
+      (item["interface"] == "FungibleToken" or item["interface"] == "FungibleAsset") and
+        Map.has_key?(item["token_info"], "price_info")
+    end)
+  end
+
+  def get_balance_for(address, api_key) do
+    url = "https://rpc.helius.xyz/?api-key=" <> api_key
+
+    body = %{
+      jsonrpc: "2.0",
+      id: "balance-#{address}",
+      method: "getBalance",
+      params: [address]
+    }
+
+    Req.post!(url, json: body).body["result"]["value"] / 1_000_000_000
+  end
+end
+```
+
+```elixir
+defmodule TokenAnalyse do
+  def analyse_lists_of_tokens(lists_of_tokens) do
+    lists_of_tokens
+    # first extract just the fields we need for each token
+    |> Enum.flat_map(fn raw_tokens ->
+      raw_tokens
+      |> Enum.map(fn token ->
+        %{
+          id: token["id"],
+          symbol: token["token_info"]["symbol"],
+          value_usd: token["token_info"]["price_info"]["total_price"]
+        }
+      end)
+    end)
+    # then flatten matching tokens by summing the value_usd field
+    # at this stage we convert to a map for deduplication
+    |> Enum.reduce(%{}, fn token, acc ->
+      {_current, new_acc} =
+        Map.get_and_update(acc, token.id, fn existing ->
+          map =
+            if existing == nil do
+              # this is a new value to store in the map
+              %{
+                symbol: token.symbol,
+                value_usd: token.value_usd
+              }
+            else
+              # just add to the value_usd
+              existing |> Map.update!(:value_usd, &(&1 + token.value_usd))
+            end
+
+          {existing, map}
+        end)
+
+      new_acc
+    end)
+    # convert back to a list, just keeping the values from the reduce
+    |> Map.values()
+  end
+end
+```
+
+```elixir
+defmodule TokenDisplay do
+  def make_displayable(analysed_tokens) do
+    sum_usd_values =
+      analysed_tokens
+      |> Enum.map(& &1.value_usd)
+      |> Enum.sum()
+
+    analysed_tokens
+    |> Enum.map(fn token ->
+      percent = (token.value_usd / sum_usd_values * 100) |> Float.round(1)
+
+      token
+      |> Map.put(:percent, percent)
+      |> Map.put(:tooltip, "#{token.symbol}: #{percent}%")
+    end)
+    # Reduce noise: only keep those that account for at least 0.5% of the portfolio
+    |> Enum.filter(&(&1.percent >= 0.5))
+  end
+
+  def render(displayable_tokens) do
+    VegaLite.new()
+    |> VegaLite.data_from_values(displayable_tokens)
+    |> VegaLite.mark(:arc)
+    |> VegaLite.encode_field(:theta, "value_usd", type: :quantitative)
+    |> VegaLite.encode_field(:color, "symbol", type: :nominal)
+    |> VegaLite.encode_field(:tooltip, "tooltip", type: :nominal)
+  end
+end
+```
+
+```elixir
+defmodule SolPrice do
+  def fetch_latest_price(api_key) do
+    sol_cmc_id = "5426"
+
+    cmc_req =
+      Req.new(base_url: "https://pro-api.coinmarketcap.com")
+      |> Req.Request.put_header("X-CMC_PRO_API_KEY", api_key)
+
+    body = Req.get!(cmc_req, url: "/v1/cryptocurrency/quotes/latest?id=#{sol_cmc_id}").body
+    body["data"][sol_cmc_id]["quote"]["USD"]["price"]
+  end
+end
+```
+
+## Analyse!
+
+```elixir
+helius_api_key = Kino.Input.read(helius_api_key_input)
+if String.length(helius_api_key) == 0, do: Kino.render("⚠️ No Helius API key!")
+
+cmc_api_key = Kino.Input.read(coinmarketcap_api_key_input)
+if String.length(cmc_api_key) == 0, do: Kino.render("⚠️ No Coinmarket API key!")
+
+addresses = Kino.Input.read(addresses_input)
+if String.length(addresses) == 0, do: Kino.render("⚠️ No addresses!")
+addresses = addresses |> String.split("\n") |> Enum.filter(&(String.length(&1) > 0))
+
+tokens =
+  addresses
+  |> Enum.map(&TokenFetcher.get_tokens_for(&1, helius_api_key))
+  |> TokenAnalyse.analyse_lists_of_tokens()
+
+sol_balance =
+  addresses
+  |> Enum.map(&TokenFetcher.get_balance_for(&1, helius_api_key))
+  |> Enum.sum()
+
+sol_price = SolPrice.fetch_latest_price(cmc_api_key)
+
+[%{symbol: "SOL", value_usd: sol_balance * sol_price} | tokens]
+|> TokenDisplay.make_displayable()
+|> TokenDisplay.render()
+```
