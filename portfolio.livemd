@@ -216,7 +216,10 @@ defmodule Analyser do
       ) do
     tokens =
       addresses
-      |> Enum.map(&TokenFetcher.get_tokens_for(&1, helius_api_key))
+      |> Enum.map(fn address ->
+        Task.async(fn -> TokenFetcher.get_tokens_for(address, helius_api_key) end)
+      end)
+      |> Enum.map(&Task.await(&1))
       |> TokenAnalyse.analyse_lists_of_tokens()
 
     sol_price =
@@ -230,7 +233,10 @@ defmodule Analyser do
       if include_unstaked_sol do
         sol_balance =
           addresses
-          |> Enum.map(&TokenFetcher.get_balance_for(&1, helius_api_key))
+          |> Enum.map(fn address ->
+            Task.async(fn -> TokenFetcher.get_balance_for(address, helius_api_key) end)
+          end)
+          |> Enum.map(&Task.await(&1))
           |> Enum.sum()
 
         [%{symbol: "SOL (unstaked)", value_usd: sol_balance * sol_price} | tokens]
@@ -242,7 +248,10 @@ defmodule Analyser do
       if include_staked_sol do
         sol_balance =
           addresses
-          |> Enum.map(&TokenFetcher.get_stake_for(&1, helius_api_key))
+          |> Enum.map(fn address ->
+            Task.async(fn -> TokenFetcher.get_stake_for(address, helius_api_key) end)
+          end)
+          |> Enum.map(&Task.await(&1))
           |> Enum.sum()
 
         [%{symbol: "SOL (staked)", value_usd: sol_balance * sol_price} | tokens]
